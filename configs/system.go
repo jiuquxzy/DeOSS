@@ -14,7 +14,7 @@ const (
 	// Name space
 	NameSpace = Name
 	// version
-	Version = Name + " " + "v0.3.7 pre-release"
+	Version = Name + " " + "v0.3.7"
 	// description
 	Description = "Object storage service based on CESS network"
 )
@@ -24,13 +24,8 @@ const (
 	Log = "log"
 	// database dir
 	Db = "db"
-	// tracked files
+	// tracked file dir
 	Track = "track"
 	//
-	Feedback = "feedback"
-	//
-	Ufile = "ufile"
-	//
-	Dfile      = "dfile"
 	FILE_CACHE = "filecache"
 )

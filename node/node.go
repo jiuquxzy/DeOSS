@@ -14,19 +14,21 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/CESSProject/DeOSS/common/confile"
+	"github.com/CESSProject/DeOSS/common/db"
+	"github.com/CESSProject/DeOSS/common/logger"
+	"github.com/CESSProject/DeOSS/common/peerrecord"
+	"github.com/CESSProject/DeOSS/common/trackfile"
 	"github.com/CESSProject/DeOSS/configs"
-	"github.com/CESSProject/DeOSS/inter"
-	"github.com/CESSProject/DeOSS/pkg/confile"
-	"github.com/CESSProject/DeOSS/pkg/db"
-	"github.com/CESSProject/DeOSS/pkg/logger"
 	"github.com/CESSProject/cess-go-sdk/chain"
+	sutils "github.com/CESSProject/cess-go-sdk/utils"
 	"github.com/CESSProject/cess-go-tools/cacher"
 	"github.com/CESSProject/cess-go-tools/scheduler"
 	"github.com/CESSProject/p2p-go/core"
 	"github.com/CESSProject/p2p-go/out"
+	"github.com/centrifuge/go-substrate-rpc-client/v4/signature"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -34,25 +36,21 @@ import (
 )
 
 type Node struct {
-	signkey            []byte
-	processingFiles    []string
-	processingFileLock *sync.RWMutex
-	trackLock          *sync.RWMutex
-	lock               *sync.RWMutex
-	blacklistLock      *sync.RWMutex
-	storagePeersLock   *sync.RWMutex
-	findPeer           *atomic.Uint32
-	storagePeers       map[string]struct{}
-	blacklist          map[string]int64
-	trackDir           string
-	fadebackDir        string
-	inter.TrackFile
-	confile.Confile
+	signkey   []byte
+	trackLock *sync.RWMutex
+	basespace string
+	fileDir   string
+	tmpDir    string
+	logDir    string
+	dbDir     string
+	trackDir  string
+	trackfile.TrackFile
 	logger.Logger
 	db.Cache
-	PeerRecord
+	peerrecord.PeerRecord
 	cacher.FileCache
 	scheduler.Selector
+	*confile.Config
 	*chain.ChainClient
 	*core.PeerNode
 	*gin.Engine
@@ -61,34 +59,28 @@ type Node struct {
 // New is used to build a node instance
 func New() *Node {
 	return &Node{
-		processingFileLock: new(sync.RWMutex),
-		trackLock:          new(sync.RWMutex),
-		lock:               new(sync.RWMutex),
-		blacklistLock:      new(sync.RWMutex),
-		storagePeersLock:   new(sync.RWMutex),
-		PeerRecord:         NewPeerRecord(),
-		TrackFile:          inter.NewTeeRecord(),
-		processingFiles:    make([]string, 0),
-		storagePeers:       make(map[string]struct{}, 0),
-		blacklist:          make(map[string]int64, 0),
-		findPeer:           new(atomic.Uint32),
+		trackLock:  new(sync.RWMutex),
+		PeerRecord: peerrecord.NewPeerRecord(),
+		TrackFile:  trackfile.NewTeeRecord(),
 	}
 }
 
+// run
 func (n *Node) Run() {
-	gin.SetMode(gin.ReleaseMode)
+	gin.SetMode(n.Config.Application.Mode)
 	n.Engine = gin.Default()
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
-	config.AddAllowHeaders("*")
 	n.Engine.MaxMultipartMemory = MaxMemUsed
 	n.Engine.Use(cors.New(config))
+
 	n.Engine.GET("/version", n.Get_version)
 	n.Engine.GET("/bucket", n.Get_bucket)
 	n.Engine.GET(fmt.Sprintf("/metadata/:%s", HTTP_ParameterName_Fid), n.Get_metadata)
 	n.Engine.GET(fmt.Sprintf("/download/:%s", HTTP_ParameterName_Fid), n.Download_file)
 	n.Engine.GET(fmt.Sprintf("/canfiles/:%s", HTTP_ParameterName_Fid), n.GetCanFileHandle)
 	n.Engine.GET(fmt.Sprintf("/open/:%s", HTTP_ParameterName_Fid), n.Preview_file)
+	n.Engine.GET(fmt.Sprintf("/location/:%s", HTTP_ParameterName_Fid), n.Get_location)
 
 	n.Engine.PUT("/bucket", n.Put_bucket)
 	n.Engine.PUT("/file", n.Put_file)
@@ -99,15 +91,82 @@ func (n *Node) Run() {
 	n.Engine.DELETE(fmt.Sprintf("/bucket/:%s", HTTP_ParameterName), n.Delete_bucket)
 
 	n.Engine.GET("/404", n.NotFound)
-	out.Tip(fmt.Sprintf("Listening on port: %d", n.GetHttpPort()))
 
 	// tasks
 	go n.TaskMgt()
 
-	err := n.Engine.Run(fmt.Sprintf(":%d", n.GetHttpPort()))
+	out.Tip(fmt.Sprintf("Listening on port: %d", n.Config.Application.Port))
+	err := n.Engine.Run(fmt.Sprintf(":%d", n.Config.Application.Port))
 	if err != nil {
 		log.Fatalf("err: %v", err)
 	}
+}
+
+func (n *Node) Setup() error {
+	var err error
+	if n.Config == nil {
+		return errors.New("setup: empty config")
+	}
+	n.signkey, err = sutils.CalcMD5(n.Config.Chain.Mnemonic)
+	if err != nil {
+		return errors.Wrap(err, "setup: ")
+	}
+	keyringPair, err := signature.KeyringPairFromSecret(n.Config.Chain.Mnemonic, 0)
+	if err != nil {
+		return errors.Wrap(err, "setup: ")
+	}
+	account, err := sutils.EncodePublicKeyAsCessAccount(keyringPair.PublicKey)
+	if err != nil {
+		return errors.Wrap(err, "setup: ")
+	}
+	n.basespace = filepath.Join(n.Application.Workspace, account, configs.NameSpace)
+
+	err = n.creatDir(n.basespace)
+	if err != nil {
+		return errors.Wrap(err, "setup: ")
+	}
+	return nil
+}
+
+func (n *Node) GetBasespace() string {
+	return n.basespace
+}
+
+func (n *Node) GetDBDir() string {
+	return n.dbDir
+}
+
+func (n *Node) GetLogDir() string {
+	return n.logDir
+}
+
+func (n *Node) creatDir(basespace string) error {
+	n.fileDir = filepath.Join(basespace, "file")
+	n.tmpDir = filepath.Join(basespace, "tmp")
+	n.logDir = filepath.Join(basespace, "log")
+	n.dbDir = filepath.Join(basespace, "db")
+	n.trackDir = filepath.Join(basespace, "track")
+	err := os.MkdirAll(n.fileDir, 0755)
+	if err != nil {
+		return err
+	}
+	err = os.MkdirAll(n.tmpDir, 0755)
+	if err != nil {
+		return err
+	}
+	err = os.MkdirAll(n.logDir, 0755)
+	if err != nil {
+		return err
+	}
+	err = os.MkdirAll(n.dbDir, 0755)
+	if err != nil {
+		return err
+	}
+	err = os.MkdirAll(n.trackDir, 0755)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (n *Node) InitFileCache(exp time.Duration, maxSpace int64, cacheDir string) {
@@ -123,49 +182,6 @@ func (n *Node) InitNodeSelector(strategy string, nodeFilePath string, maxNodeNum
 	//refresh the user-configured storage node list
 	n.Selector.FlushlistedPeerNodes(scheduler.DEFAULT_TIMEOUT, n.GetDHTable())
 	return nil
-}
-
-func (n *Node) SaveStoragePeer(peerid string) {
-	n.storagePeersLock.Lock()
-	n.storagePeers[peerid] = struct{}{}
-	n.storagePeersLock.Unlock()
-}
-
-func (n *Node) DeleteStoragePeer(peerid string) {
-	n.storagePeersLock.Lock()
-	delete(n.storagePeers, peerid)
-	n.storagePeersLock.Unlock()
-}
-
-func (n *Node) HasStoragePeer(peerid string) bool {
-	n.storagePeersLock.RLock()
-	defer n.storagePeersLock.RUnlock()
-	_, ok := n.storagePeers[peerid]
-	return ok
-}
-
-func (n *Node) GetAllStoragePeerId() []string {
-	n.storagePeersLock.RLock()
-	defer n.storagePeersLock.RUnlock()
-	var result = make([]string, len(n.storagePeers))
-	var i int
-	for k := range n.storagePeers {
-		result[i] = k
-		i++
-	}
-	return result
-}
-
-func (n *Node) SetSignkey(signkey []byte) {
-	n.signkey = signkey
-}
-
-func (n *Node) SetTrackDir(dir string) {
-	n.trackDir = dir
-}
-
-func (n *Node) SetFadebackDir(dir string) {
-	n.fadebackDir = dir
 }
 
 func (n *Node) WriteTrackFile(fid string, data []byte) error {
@@ -203,15 +219,35 @@ func (n *Node) WriteTrackFile(fid string, data []byte) error {
 	return err
 }
 
-func (n *Node) ParseTrackFile(filehash string) (RecordInfo, error) {
-	var result RecordInfo
+func (n *Node) ParseTrackFile(filehash string) (TrackerInfo, error) {
+	var result TrackerInfo
 	n.trackLock.RLock()
-	defer n.trackLock.RUnlock()
 	b, err := os.ReadFile(filepath.Join(n.trackDir, filehash))
 	if err != nil {
+		n.trackLock.RUnlock()
 		return result, err
 	}
+	n.trackLock.RUnlock()
+
 	err = json.Unmarshal(b, &result)
+	if err != nil {
+		var resultold RecordInfo
+		err = json.Unmarshal(b, &resultold)
+		if err != nil {
+			return result, err
+		}
+		result.Segment = resultold.Segment
+		result.Owner = resultold.Owner
+		result.Fid = resultold.Fid
+		result.FileName = resultold.FileName
+		result.BucketName = resultold.BucketName
+		result.TerritoryName = resultold.TerritoryName
+		result.CacheDir = resultold.CacheDir
+		result.Cipher = resultold.Cipher
+		result.FileSize = resultold.FileSize
+		result.PutFlag = resultold.PutFlag
+		return result, nil
+	}
 	return result, err
 }
 
@@ -240,11 +276,12 @@ func (n *Node) DeleteTrackFile(filehash string) {
 }
 
 func (n *Node) RebuildDirs() {
-	os.RemoveAll(n.GetDirs().TmpDir)
-	os.RemoveAll(filepath.Join(n.Workspace(), configs.Db))
-	os.RemoveAll(filepath.Join(n.Workspace(), configs.Log))
-	os.RemoveAll(filepath.Join(n.Workspace(), configs.Track))
-	os.MkdirAll(n.GetDirs().FileDir, 0755)
-	os.MkdirAll(n.GetDirs().TmpDir, 0755)
-	os.MkdirAll(filepath.Join(n.Workspace(), configs.Track), 0755)
+	os.RemoveAll(n.tmpDir)
+	os.RemoveAll(n.dbDir)
+	os.RemoveAll(n.logDir)
+	os.RemoveAll(n.trackDir)
+	os.MkdirAll(n.tmpDir, 0755)
+	os.MkdirAll(n.dbDir, 0755)
+	os.MkdirAll(n.logDir, 0755)
+	os.MkdirAll(n.trackDir, 0755)
 }
